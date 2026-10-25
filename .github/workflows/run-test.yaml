@@ -1,20 +1,21 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector forwarded to tox posargs"
+        required: false
+        default: ""
+
+env:
+  PIP_INDEX_URL: https://:2022-11-15T14:37:53.675556Z@time-machines-pypi.sealsecurity.io/
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner || matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
@@ -34,6 +35,19 @@ jobs:
           - os: "windows-latest"
             python-version: "3.10"
 
+        include:
+          # setup-python ships no CPython 3.7 for ubuntu-24.04 (ubuntu-latest);
+          # ubuntu-22.04 still has a prebuilt 3.7
+          - os: "ubuntu-latest"
+            python-version: "3.7"
+            runner: "ubuntu-22.04"
+          # macos-latest is arm64 and setup-python has no usable CPython 3.7
+          # for it (its x64 build links Intel Homebrew's gettext); install the
+          # self-contained python.org x86_64 build and run it under Rosetta
+          - os: "macos-latest"
+            python-version: "3.7"
+            python-org-pkg: "3.7.9"
+
       fail-fast: false
 
     # steps to run in each job. Some are github actions, others run shell commands
@@ -42,16 +56,44 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: ${{ !matrix.python-org-pkg }}
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+
+      - name: Set up python (python.org installer)
+        if: ${{ matrix.python-org-pkg }}
+        run: |
+          PKG="python-${{ matrix.python-org-pkg }}-macosx10.9.pkg"
+          curl -sSfL -o "$RUNNER_TEMP/$PKG" "https://www.python.org/ftp/python/${{ matrix.python-org-pkg }}/$PKG"
+          sudo installer -pkg "$RUNNER_TEMP/$PKG" -target /
+          "/Library/Frameworks/Python.framework/Versions/${{ matrix.python-version }}/bin/python${{ matrix.python-version }}" -m venv "$RUNNER_TEMP/py"
+          echo "$RUNNER_TEMP/py/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/py/bin/python" -c "import sys, platform, ssl; print(sys.version, platform.machine(), ssl.OPENSSL_VERSION)"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install --upgrade tox setuptools
+          # runner images preinstall setuptools 79, which needs packaging>=22;
+          # pin the release-era setuptools that matches the time-machined packaging
+          pip install setuptools==65.5.1
           pip list
 
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        run: |
+          pip install --upgrade setuptools wheel==0.38.4
+          python setup.py egg_info -Db "" sdist bdist_wheel
+
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      - name: Upload distributions
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
